@@ -113,9 +113,10 @@ def test_section_and_god_schedule():
     optimizer = get_optimizer()
     india_time = datetime.utcnow() + timedelta(hours=5, minutes=30)
     current_weekday = india_time.weekday()
-    today_schedule = GodCategoryOptimizer.DAY_GOD_SCHEDULE.get(current_weekday, {})
+    day_name = GodCategoryOptimizer.DAY_NAMES[current_weekday]
+    today_schedule = GodCategoryOptimizer.FALLBACK_GOD_SCHEDULE.get(current_weekday, {})
 
-    print(f"📅 Current Day: {today_schedule.get('day')} | Active Deities: {today_schedule.get('description')}")
+    print(f"📅 Current Day: {day_name} | Active Deities: {today_schedule.get('gods')}")
 
     god_recs = optimizer.get_recommendations(
         user_id="god_test_user",

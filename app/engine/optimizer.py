@@ -351,7 +351,7 @@ class CategoryOptimizer:
                             "metrics": metrics.dict(),
                             "user_strategy": user_strategy_label,
                             "section": section,
-                            "active_session": SessionTimeSlotOptimizer.get_current_session(india_time.hour)
+                            "active_session": self.session_optimizer.get_current_session_from_db(india_time.hour)
                         }
                     )
                     scored_feeds.append(recommendation)

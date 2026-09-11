@@ -1,20 +1,15 @@
 # ============================================================================
-# PRITHU BACKEND - GOD CATEGORY OPTIMIZER
+# PRITHU BACKEND - GOD CATEGORY OPTIMIZER (DATABASE-DRIVEN)
 # ============================================================================
-# Enforces the 24-Hour Day-of-Week God Schedule (12:00 AM to 11:59 PM)
-# ============================================================================
-# Monday:    🔱 Shiva / Parvati / Natarajar
-# Tuesday:   🦚 Murugan / Amman / Karuppasamy
-# Wednesday: 🐘 Vinayagar (Ganesha) / Saraswati / Ayyanar
-# Thursday:  🙏 Dakshinamurthy / Perumal / Rama
-# Friday:    🌺 Meenakshi / Mariamman / Mahalakshmi / Andal
-# Saturday:  🪐 Saneeswaran / Ayyappan / Hanuman
-# Sunday:    ☀️ Surya / Krishna / Perumal / Murugan
+# Enforces the 24-Hour Day-of-Week God Schedule dynamically from MongoDB
+# Collection: PostGlobalOptions (weekGods array)
 # ============================================================================
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Set
 from datetime import datetime
 
+from app.core.config import Config
+from app.database.db_connection import get_db_manager
 from app.core.logger_setup import get_logger
 from app.exceptions import OptimizerException
 
@@ -24,103 +19,101 @@ logger = get_logger(__name__)
 class GodCategoryOptimizer:
     """
     Sub-Optimizer enforcing 24-hour Day-of-Week God Schedule.
-    Filters devotional/God content so that only the deities assigned to today's day
-    are active from 12:00 AM to 11:59 PM.
+    Dynamically queries PostGlobalOptions (weekGods array) in MongoDB.
     """
 
-    # Day of Week Schedule Mapping (0 = Monday, 1 = Tuesday, ..., 6 = Sunday)
-    DAY_GOD_SCHEDULE = {
-        0: {  # Monday
-            "day": "Monday",
-            "gods": ["shiva", "parvati", "natarajar", "nataraja", "sivan"],
-            "description": "🔱 Shiva / Parvati / Natarajar"
-        },
-        1: {  # Tuesday
-            "day": "Tuesday",
-            "gods": ["murugan", "amman", "karuppasamy", "subramanya", "karthikeya"],
-            "description": "🦚 Murugan / Amman / Karuppasamy"
-        },
-        2: {  # Wednesday
-            "day": "Wednesday",
-            "gods": ["vinayagar", "ganesha", "ganesh", "saraswati", "ayyanar", "pillayar"],
-            "description": "🐘 Vinayagar (Ganesha) / Saraswati / Ayyanar"
-        },
-        3: {  # Thursday
-            "day": "Thursday",
-            "gods": ["dakshinamurthy", "perumal", "rama", "baba", "sai baba", "guru"],
-            "description": "🙏 Dakshinamurthy / Perumal / Rama"
-        },
-        4: {  # Friday
-            "day": "Friday",
-            "gods": ["meenakshi", "mariamman", "mahalakshmi", "lakshmi", "andal", "durga", "devi"],
-            "description": "🌺 Meenakshi / Mariamman / Mahalakshmi / Andal"
-        },
-        5: {  # Saturday
-            "day": "Saturday",
-            "gods": ["saneeswaran", "shani", "ayyappan", "ayyappa", "hanuman", "anjaneya", "venkateswara"],
-            "description": "🪐 Saneeswaran / Ayyappan / Hanuman"
-        },
-        6: {  # Sunday
-            "day": "Sunday",
-            "gods": ["surya", "krishna", "perumal", "murugan", "sun god"],
-            "description": "☀️ Surya / Krishna / Perumal / Murugan"
-        }
+    # Static fallback schedule if DB options are unpopulated
+    FALLBACK_GOD_SCHEDULE = {
+        0: {"day": "Monday", "gods": ["shiva", "parvati", "natarajar", "nataraja", "sivan"]},
+        1: {"day": "Tuesday", "gods": ["murugan", "amman", "karuppasamy", "subramanya"]},
+        2: {"day": "Wednesday", "gods": ["vinayagar", "ganesha", "ganesh", "saraswati", "ayyanar"]},
+        3: {"day": "Thursday", "gods": ["dakshinamurthy", "perumal", "rama", "baba", "sai baba"]},
+        4: {"day": "Friday", "gods": ["meenakshi", "mariamman", "mahalakshmi", "lakshmi", "andal", "durga"]},
+        5: {"day": "Saturday", "gods": ["saneeswaran", "shani", "ayyappan", "hanuman", "anjaneya"]},
+        6: {"day": "Sunday", "gods": ["surya", "krishna", "perumal", "murugan"]}
     }
 
-    # All known God keywords for identification
-    ALL_GOD_KEYWORDS = [
-        "god", "bhakti", "devotional", "god quotes", "shiva", "parvati", "natarajar",
-        "murugan", "amman", "karuppasamy", "vinayagar", "ganesha", "saraswati",
-        "ayyanar", "dakshinamurthy", "perumal", "rama", "meenakshi", "mariamman",
-        "mahalakshmi", "andal", "saneeswaran", "ayyappan", "hanuman", "surya", "krishna"
-    ]
+    DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-    def is_god_post(self, feed: Dict[str, Any], cat_name: str) -> bool:
+    def __init__(self):
+        self.db = get_db_manager()
+
+    def get_todays_god_keywords_from_db(self, current_weekday: int) -> Set[str]:
         """
-        Check if a post is a God/Devotional content post.
+        Query MongoDB PostGlobalOptions.weekGods for active God names assigned to today's weekday.
 
         Args:
-            feed: Feed document
-            cat_name: Category display name
+            current_weekday: Weekday index (0 = Monday, ..., 6 = Sunday)
 
         Returns:
-            True if post is God/Devotional content
+            Set of active God name keyword strings
         """
+        try:
+            day_name = self.DAY_NAMES[current_weekday]
+            global_options = self.db.find_one("PostGlobalOptions", {})
+
+            god_keywords = set()
+
+            if global_options and "weekGods" in global_options:
+                week_gods = global_options.get("weekGods", [])
+                for item in week_gods:
+                    if item.get("isActive", True) and str(item.get("day")).lower() == day_name.lower():
+                        gname = str(item.get("godName", "")).lower().strip()
+                        cname = str(item.get("categoryName", "")).lower().strip()
+                        if gname:
+                            god_keywords.add(gname)
+                            # Split individual deity names (e.g. "Goddess Durga / Amman" -> ["durga", "amman"])
+                            for part in gname.replace("/", " ").replace("-", " ").split():
+                                if len(part) > 3 and part not in ["goddess", "lord", "mother"]:
+                                    god_keywords.add(part)
+                        if cname:
+                            god_keywords.add(cname)
+
+            if god_keywords:
+                logger.debug(f"🙏 Loaded {len(god_keywords)} active God keywords dynamically from MongoDB for {day_name}")
+                return god_keywords
+
+            # Fallback to static schedule if MongoDB weekGods is empty
+            fallback_gods = self.FALLBACK_GOD_SCHEDULE.get(current_weekday, {}).get("gods", [])
+            logger.debug(f"🙏 Using fallback God keywords for {day_name}: {fallback_gods}")
+            return set(fallback_gods)
+
+        except Exception as e:
+            logger.warning(f"Error reading weekGods from PostGlobalOptions: {e}")
+            fallback_gods = self.FALLBACK_GOD_SCHEDULE.get(current_weekday, {}).get("gods", [])
+            return set(fallback_gods)
+
+    def is_god_post(self, feed: Dict[str, Any], cat_name: str) -> bool:
+        """Check if post is God/Devotional content."""
         cat_lower = str(cat_name).lower().strip()
         caption_lower = str(feed.get("caption", "")).lower()
 
         if feed.get("isGod") is True or feed.get("quickSelect") == "GOD":
             return True
 
-        if any(k in cat_lower for k in self.ALL_GOD_KEYWORDS):
-            return True
-
-        if any(k in caption_lower for k in self.ALL_GOD_KEYWORDS):
+        god_indicators = ["god", "bhakti", "devotional", "god quotes", "spiritual", "worship", "temple"]
+        if any(k in cat_lower for k in god_indicators) or any(k in caption_lower for k in god_indicators):
             return True
 
         return False
 
-    def is_god_matching_today(self, cat_name: str, current_weekday: int) -> bool:
-        """
-        Check if God category matches today's designated weekday deities.
-
-        Args:
-            cat_name: Category name or feed text
-            current_weekday: Weekday index (0 = Monday ... 6 = Sunday)
-
-        Returns:
-            True if deity matches today's schedule
-        """
+    def is_god_matching_today(self, feed: Dict[str, Any], cat_name: str, active_god_keywords: Set[str]) -> bool:
+        """Check if God post matches today's active deities."""
         cat_lower = str(cat_name).lower().strip()
-        today_info = self.DAY_GOD_SCHEDULE.get(current_weekday, {})
-        today_gods = today_info.get("gods", [])
+        caption_lower = str(feed.get("caption", "")).lower()
 
-        # Generic "God", "Devotional", "Bhakti" posts match any day
-        if cat_lower in ["god", "god quotes", "devotional", "bhakti"]:
+        # Generic God posts (e.g. "God Quotes", "Devotional") match every day
+        if cat_lower in ["god", "god quotes", "devotional", "bhakti", "spiritual"]:
             return True
 
-        # Specific God posts match if deity is in today's allowed list
-        return any(g in cat_lower for g in today_gods)
+        # Check if category or caption matches any of today's active God keywords from DB
+        if any(k in cat_lower for k in active_god_keywords):
+            return True
+
+        if any(k in caption_lower for k in active_god_keywords):
+            return True
+
+        return False
 
     def apply_god_schedule_filter(
         self,
@@ -129,26 +122,13 @@ class GodCategoryOptimizer:
         current_time: datetime,
         section: str
     ) -> List[Dict[str, Any]]:
-        """
-        Apply 24-hour Day-of-Week God Schedule filter.
-        At 12:00 AM midnight, Friday's Gods expire and Saturday's Gods unlock.
-
-        Args:
-            candidates: Candidate feed documents
-            categories_map: Category ID to name map
-            current_time: Current datetime (IST)
-            section: Requested section tab ('all', 'special_day', 'god', 'general')
-
-        Returns:
-            Filtered list of candidate feeds
-        """
+        """Apply 24-hour Day-of-Week God Schedule filter dynamically from MongoDB."""
         try:
             current_weekday = current_time.weekday()
-            today_schedule = self.DAY_GOD_SCHEDULE.get(current_weekday, {})
-            day_name = today_schedule.get("day", "Today")
-            description = today_schedule.get("description", "")
+            day_name = self.DAY_NAMES[current_weekday]
+            active_god_keywords = self.get_todays_god_keywords_from_db(current_weekday)
 
-            logger.info(f"🙏 24-Hour God Schedule [{day_name}]: Active Deities ➔ {description}")
+            logger.info(f"🙏 24-Hour God Schedule [{day_name}]: Active DB Keywords ➔ {list(active_god_keywords)[:6]}")
 
             is_god_section = (section.lower() == "god")
             filtered = []
@@ -162,15 +142,13 @@ class GodCategoryOptimizer:
                 is_god = self.is_god_post(feed, cat_name)
 
                 if is_god_section:
-                    # Under God section: Return ONLY God posts that match TODAY'S weekday schedule
-                    if is_god and self.is_god_matching_today(cat_name, current_weekday):
+                    if is_god and self.is_god_matching_today(feed, cat_name, active_god_keywords):
                         filtered.append(feed)
                     else:
                         mismatched_count += 1
                 else:
-                    # In other sections: If it's a God post, only allow if it matches today's schedule
                     if is_god:
-                        if self.is_god_matching_today(cat_name, current_weekday):
+                        if self.is_god_matching_today(feed, cat_name, active_god_keywords):
                             filtered.append(feed)
                         else:
                             mismatched_count += 1
