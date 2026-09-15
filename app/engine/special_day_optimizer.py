@@ -58,17 +58,21 @@ class SpecialDayOptimizer:
                         item_date_str = str(item.get("date", "")).strip()
 
                         # Exact date match ("YYYY-MM-DD")
-                        if item_date_str == today_str:
-                            active_festivals.add(item_name)
+                        is_active_today = (item_date_str == today_str)
 
                         # Recurring yearly match (Month & Day match)
-                        elif item.get("isRecurringYearly", True) and len(item_date_str) >= 10:
+                        if not is_active_today and item.get("isRecurringYearly", True) and len(item_date_str) >= 10:
                             try:
                                 item_date = datetime.strptime(item_date_str[:10], "%Y-%m-%d")
                                 if item_date.month == current_date.month and item_date.day == current_date.day:
-                                    active_festivals.add(item_name)
+                                    is_active_today = True
                             except ValueError:
                                 pass
+
+                        if is_active_today:
+                            # Split combined names (e.g., "Pongal / Makar Sankranti" -> "pongal", "makar sankranti")
+                            for part in item_name.split("/"):
+                                active_festivals.add(part.strip())
 
             if active_festivals:
                 logger.debug(f"🎉 Active DB Festivals for today ({today_str}): {active_festivals}")

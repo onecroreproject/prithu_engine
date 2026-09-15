@@ -14,6 +14,8 @@ from app.database.db_connection import get_db_manager
 from app.core.logger_setup import get_logger
 from app.exceptions import OptimizerException
 
+from datetime import datetime, timedelta
+
 logger = get_logger(__name__)
 
 
@@ -24,20 +26,22 @@ class UserPreferenceOptimizer:
     2. Performs Alternative Substitution: Replaces filtered-out categories with user's top-preferred or trending categories so daily feed count (20-30) is maintained.
     3. Scores engagement signals from UserFeedAnalytics (watch time, completion rate, likes, shares, saves, skips).
     """
+    _non_interested_cache: Dict[str, Any] = {}
+    _affinity_cache: Dict[str, Any] = {}
 
     def __init__(self):
         self.db = get_db_manager()
 
     def get_non_interested_categories(self, user_id: str) -> Set[str]:
         """
-        Fetch category ObjectIds marked as 'Not Interested' by the user.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            Set of non-interested category ID strings
+        Fetch category ObjectIds marked as 'Not Interested' by the user with caching.
         """
+        now = datetime.utcnow()
+        if user_id in self._non_interested_cache:
+            cached_at, non_int = self._non_interested_cache[user_id]
+            if (now - cached_at).total_seconds() < 60:
+                return non_int
+
         try:
             user_filter = {}
             if ObjectId.is_valid(user_id):
@@ -45,13 +49,15 @@ class UserPreferenceOptimizer:
             else:
                 user_filter = {"userId": user_id}
 
-            record = self.db.find_one("UserCategorys", user_filter)
+            record = self.db.find_one("UserCategorys", user_filter, projection={"nonInterestedCategories": 1})
             if not record:
+                self._non_interested_cache[user_id] = (now, set())
                 return set()
 
             raw_list = record.get("nonInterestedCategories", [])
             non_interested = {str(cid) for cid in raw_list}
 
+            self._non_interested_cache[user_id] = (now, non_interested)
             logger.debug(f"🚫 User {user_id} has {len(non_interested)} non-interested categories")
             return non_interested
 
@@ -61,14 +67,14 @@ class UserPreferenceOptimizer:
 
     def calculate_user_category_affinity(self, user_id: str) -> Dict[str, float]:
         """
-        Calculate category interest scores for user based on UserFeedAnalytics history.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            Dict mapping category_id string to score weight
+        Calculate category interest scores for user based on UserFeedAnalytics history with caching.
         """
+        now = datetime.utcnow()
+        if user_id in self._affinity_cache:
+            cached_at, aff = self._affinity_cache[user_id]
+            if (now - cached_at).total_seconds() < 60:
+                return aff
+
         try:
             user_filter = {}
             if ObjectId.is_valid(user_id):
@@ -79,7 +85,12 @@ class UserPreferenceOptimizer:
             analytics = self.db.find_many(
                 Config.COLLECTION_USER_FEED_ANALYTICS,
                 user_filter,
-                limit=500
+                projection={
+                    "feedId": 1, "liked": 1, "saved": 1, "shared": 1,
+                    "commented": 1, "percentageWatched": 1, "skipped": 1,
+                    "replayCount": 1, "notInterested": 1
+                },
+                limit=300
             )
 
             weights = Config.INTERACTION_WEIGHTS

@@ -12,6 +12,8 @@ from app.database.db_connection import get_db_manager
 from app.core.logger_setup import get_logger
 from app.exceptions import OptimizerException
 
+from datetime import datetime, timedelta
+
 logger = get_logger(__name__)
 
 
@@ -20,20 +22,21 @@ class LifetimeSeenFilter:
     Sub-Optimizer responsible for permanent, lifetime exclusion of viewed content.
     Queries UserSeenHistory collection and merges with explicit exclude_ids.
     """
+    _seen_cache: Dict[str, Any] = {}
 
     def __init__(self):
         self.db = get_db_manager()
 
     def get_seen_feed_ids(self, user_id: str) -> Set[str]:
         """
-        Fetch all feed IDs ever viewed by user from UserSeenHistory collection.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            Set of seen feed ID strings
+        Fetch all feed IDs ever viewed by user from UserSeenHistory collection with caching.
         """
+        now = datetime.utcnow()
+        if user_id in self._seen_cache:
+            cached_at, seen_set = self._seen_cache[user_id]
+            if (now - cached_at).total_seconds() < 60:
+                return seen_set
+
         try:
             user_filter = {}
             if ObjectId.is_valid(user_id):
@@ -44,7 +47,8 @@ class LifetimeSeenFilter:
             records = self.db.find_many(
                 Config.COLLECTION_USER_SEEN_HISTORY,
                 user_filter,
-                projection={"feedId": 1, "contentId": 1}
+                projection={"feedId": 1, "contentId": 1},
+                limit=3000
             )
 
             seen_ids = set()
@@ -53,6 +57,7 @@ class LifetimeSeenFilter:
                 if fid:
                     seen_ids.add(str(fid))
 
+            self._seen_cache[user_id] = (now, seen_ids)
             logger.debug(f"🔍 User {user_id} has seen {len(seen_ids)} feeds in lifetime")
             return seen_ids
 

@@ -179,6 +179,7 @@ class RecommendationResponse(BaseModel):
     success: bool
     user_id: str
     recommended_feeds: List[FeedRecommendation]
+    recommended_reels: Optional[List[FeedRecommendation]] = None
     total_count: int
     engine_status: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
@@ -217,6 +218,7 @@ class AnalysisResponse(BaseModel):
     success: bool
     feed_id: str
     analysis: FeedAnalysisResult
+    metadata: Optional[FeedAnalysisResult] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
     model_config = ConfigDict(from_attributes=True)

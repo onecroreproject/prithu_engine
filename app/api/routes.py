@@ -271,6 +271,7 @@ async def get_recommendations(request: RecommendationRequest):
             success=True,
             user_id=request.user_id,
             recommended_feeds=recommendations,
+            recommended_reels=recommendations,
             total_count=len(recommendations),
             engine_status="online",
             metadata={
@@ -348,7 +349,8 @@ async def analyze_feed(request: FeedAnalysisRequest):
         response = AnalysisResponse(
             success=True,
             feed_id=request.feed_id,
-            analysis=analysis_result
+            analysis=analysis_result,
+            metadata=analysis_result
         )
 
         logger.info(f"✅ Analyzed feed {request.feed_id}")
@@ -435,6 +437,36 @@ async def track_interaction(request: TrackInteractionRequest):
     except Exception as e:
         logger.error(f"Error tracking interaction: {e}")
         raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+
+
+# ============================================================================
+# CACHE & ENGINE REFRESH ENDPOINT
+# ============================================================================
+
+@app.post("/api/v1/refresh")
+@app.post("/refresh")
+async def refresh_engine():
+    """
+    Refresh cache and reload category/festival weights.
+    Called periodically by Node.js cron or admin panel.
+    """
+    try:
+        optimizer = get_optimizer()
+        optimizer.categories = optimizer._load_categories(force_refresh=True)
+        from app.engine.recency_engine import UserRecencyStaggerEngine
+        from app.engine.lifetime_filter import LifetimeSeenFilter
+        from app.engine.user_preference_optimizer import UserPreferenceOptimizer
+        UserRecencyStaggerEngine._feed_pool_cache = []
+        UserRecencyStaggerEngine._feed_pool_cached_at = None
+        UserRecencyStaggerEngine._user_profile_cache.clear()
+        LifetimeSeenFilter._seen_cache.clear()
+        UserPreferenceOptimizer._non_interested_cache.clear()
+        UserPreferenceOptimizer._affinity_cache.clear()
+        logger.info("✅ Cleared all feed pool and user metadata in-memory caches")
+        return {"success": True, "message": "ML Engine cache refreshed successfully"}
+    except Exception as e:
+        logger.error(f"Failed to refresh engine: {e}")
+        return {"success": False, "error": str(e)}
 
 
 # ============================================================================

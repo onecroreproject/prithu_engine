@@ -87,6 +87,18 @@ class SessionTimeSlotOptimizer:
         """Helper to get fallback session name."""
         return cls.get_fallback_session(current_hour)
 
+    @classmethod
+    def get_fallback_session(cls, current_hour: int) -> str:
+        """Determine fallback session if DB is unpopulated or missing slots."""
+        if 5 <= current_hour < 12:
+            return cls.SESSION_MORNING
+        elif 12 <= current_hour < 16:
+            return cls.SESSION_AFTERNOON
+        elif 16 <= current_hour < 19:
+            return cls.SESSION_EVENING
+        else:
+            return cls.SESSION_NIGHT
+
     def is_post_matching_session(
         self,
         category_name: str,
