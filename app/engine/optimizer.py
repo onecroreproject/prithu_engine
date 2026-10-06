@@ -15,6 +15,7 @@ from app.models.schemas import (
     ScoringMetrics,
     CategoryMetadata
 )
+from app.database.redis_cache import get_redis_manager
 from app.exceptions import (
     OptimizerException,
     ScoringException,
@@ -55,6 +56,7 @@ class CategoryOptimizer:
         self.special_day_optimizer = SpecialDayOptimizer()
         self.god_optimizer = GodCategoryOptimizer()
         self.session_optimizer = SessionTimeSlotOptimizer()
+        self.redis = get_redis_manager()
 
         self._category_cache: Dict[str, CategoryMetadata] = {}
         self._category_names_map: Dict[str, str] = {}
@@ -118,30 +120,63 @@ class CategoryOptimizer:
     # SCORING METHODS
     # ========================================================================
 
-    def _calculate_trending_score(self, feed: Dict[str, Any], total_views_max: float, total_likes_max: float) -> float:
-        """Calculate trending score based on views and likes."""
+    def _calculate_freshness_score(self, feed: Dict[str, Any], current_date: datetime) -> float:
+        """Calculate freshness score based on createdAt date."""
         try:
-            v_max = max(1.0, total_views_max)
-            l_max = max(1.0, total_likes_max)
-
-            views = feed.get("total_views", feed.get("playbackStats", {}).get("totalViews", 0))
-            likes = feed.get("likes", feed.get("engagementStats", {}).get("likes", 0))
-
-            views_score = (views / v_max) * 40.0
-            likes_score = (likes / l_max) * 60.0
-
-            return min(100.0, views_score + likes_score)
+            created_at = feed.get("createdAt")
+            if not isinstance(created_at, datetime):
+                return 0.0
+            
+            hours_old = (current_date - created_at).total_seconds() / 3600.0
+            if hours_old <= 48:
+                return 30.0  # Massive boost for videos under 48 hours old
+            elif hours_old <= 168: # 1 week
+                return max(0.0, 30.0 - ((hours_old - 48) / 4))
+            else:
+                return 0.0
         except Exception:
             return 0.0
 
-    def _calculate_push_score(self, feed: Dict[str, Any]) -> float:
-        """Calculate push score for high engagement posts."""
+    def _calculate_engagement_score(self, feed: Dict[str, Any]) -> float:
+        """Calculate engagement score based on percentageWatched and scrollStopDuration."""
         try:
-            views = feed.get("total_views", feed.get("playbackStats", {}).get("totalViews", 0))
-            likes = feed.get("likes", feed.get("engagementStats", {}).get("likes", 0))
-            if views >= 1000 or likes >= 50:
-                return 100.0
+            # The backend aggregates the UserFeedAnalytics into Feeds, or we use raw fields
+            pct_watched = feed.get("playbackStats", {}).get("completionRate", 0)
+            if pct_watched == 0:
+                pct_watched = feed.get("percentageWatched", 0)
+                
+            scroll_duration = feed.get("engagementStats", {}).get("scrollStopDuration", 0)
+            if scroll_duration == 0:
+                scroll_duration = feed.get("scrollStopDuration", 0)
+            
+            score = 0.0
+            if pct_watched > 0:
+                score += min(40.0, (pct_watched / 100.0) * 40.0)
+            
+            # For images, 3 seconds = 3000ms = great engagement
+            if scroll_duration > 3000:
+                score += 40.0
+            elif scroll_duration > 1000:
+                score += 20.0
+                
+            return score
+        except Exception:
             return 0.0
+
+    def _calculate_ml_quality_score(self, feed: Dict[str, Any]) -> float:
+        """Calculate score based on ML confidence."""
+        try:
+            confidence = feed.get("mlMetadata", {}).get("confidenceScore", 0.0)
+            return min(30.0, confidence * 30.0)
+        except Exception:
+            return 0.0
+
+    def _calculate_social_proof_score(self, feed: Dict[str, Any], total_views_max: float, total_likes_max: float) -> float:
+        """Calculate basic trending score for social proof."""
+        try:
+            v_max = max(1.0, total_views_max)
+            views = feed.get("total_views", feed.get("playbackStats", {}).get("totalViews", 0))
+            return min(10.0, (views / v_max) * 10.0)
         except Exception:
             return 0.0
 
@@ -152,30 +187,36 @@ class CategoryOptimizer:
         total_views_max: float,
         total_likes_max: float
     ) -> ScoringMetrics:
-        """Calculate final recommendation score."""
+        """Calculate final recommendation score using the 4-Pillar Formula."""
         try:
-            push_score = self._calculate_push_score(feed)
-            trending_score = self._calculate_trending_score(feed, total_views_max, total_likes_max)
+            engagement_score = self._calculate_engagement_score(feed)
+            ml_quality_score = self._calculate_ml_quality_score(feed)
+            freshness_score = self._calculate_freshness_score(feed, current_date)
+            social_proof_score = self._calculate_social_proof_score(feed, total_views_max, total_likes_max)
 
-            final_score = (
-                (Config.WEIGHT_PUSH * push_score) +
-                (Config.WEIGHT_TRENDING * trending_score)
-            )
+            # The 4-Pillar Perfect Formula
+            # 1. True Engagement (40%)
+            # 2. ML Quality (30%)
+            # 3. Freshness (20%)
+            # 4. Social Proof (10%)
+            final_score = engagement_score + ml_quality_score + freshness_score + social_proof_score
 
             final_score = min(100.0, final_score)
 
             reasons = []
-            if push_score > 0:
-                reasons.append("High engagement")
-            if trending_score > 50:
-                reasons.append("Trending")
+            if freshness_score >= 20:
+                reasons.append(f"Fresh Content (+{round(freshness_score,1)})")
+            if engagement_score >= 20:
+                reasons.append(f"High Engagement (+{round(engagement_score,1)})")
+            if ml_quality_score >= 20:
+                reasons.append(f"High Quality Match (+{round(ml_quality_score,1)})")
 
             return ScoringMetrics(
                 feed_id=str(feed.get("_id")),
-                festival_score=0.0,
-                trending_score=round(trending_score, 2),
-                push_score=push_score,
-                time_relevance_score=0.0,
+                festival_score=freshness_score, # repurposing legacy field for debug tracking
+                trending_score=engagement_score,
+                push_score=ml_quality_score,
+                time_relevance_score=social_proof_score,
                 final_score=round(final_score, 2),
                 reasons=reasons or ["General recommendation"]
             )
@@ -223,13 +264,23 @@ class CategoryOptimizer:
             List of FeedRecommendation objects
         """
         try:
-            # Enforce Daily Limit Rules:
-            # Special Day Section: EXEMPT from limit (returns all active festival posts, e.g. 50+)
-            # General / All Sections: Quota capped at 20-30 items per day.
+            # Limit Enforcement: Max 30 PER DAY
             if section.lower() == "special_day":
                 target_limit = max(limit, 100)  # Return all active special day posts
             else:
-                target_limit = min(max(limit, 10), 30)  # Daily quota: 20-30 items
+                # Instead of standard limit, we cap at max 30 per request
+                target_limit = min(limit, 30)
+
+            # Generate cache key
+            cache_key = f"recs:{user_id}:{target_limit}:{section}:{prefer_short}:{language}:{category_id}:{sub_category}"
+            if diversity_boost:
+                cache_key += ":div"
+            
+            # Try to get from cache
+            cached_result = self.redis.get(cache_key)
+            if cached_result:
+                logger.info(f"🎯 Returning cached recommendations for user {user_id}")
+                return [FeedRecommendation(**item) for item in cached_result]
 
             logger.info(f"🎯 Requesting recommendations for user {user_id} [Section: '{section}', Target Quota: {target_limit}]")
 
@@ -368,6 +419,9 @@ class CategoryOptimizer:
                 scored_feeds = self._apply_diversity_filter(scored_feeds, max_per_category=5)
 
             result = scored_feeds[:target_limit]
+            
+            # Cache the result for 5 minutes (300 seconds)
+            self.redis.set(cache_key, [r.dict() for r in result], ttl=300)
 
             logger.info(f"✅ Delivered {len(result)} [{user_strategy_label}] recommendations [Section: '{section}'] to user {user_id}")
             return result

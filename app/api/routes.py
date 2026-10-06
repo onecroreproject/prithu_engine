@@ -9,10 +9,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import traceback
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from app.core.config import Config
 from app.core.logger_setup import get_logger
@@ -111,6 +112,11 @@ app = FastAPI(
     version=Config.APP_VERSION,
     lifespan=lifespan
 )
+
+# Prometheus Metrics
+REQUEST_COUNT = Counter('request_count', 'App Request Count', ['method', 'endpoint', 'http_status'])
+REQUEST_LATENCY = Histogram('request_latency_seconds', 'Request latency', ['endpoint'])
+RECOMMENDATION_COUNT = Counter('recommendation_count', 'Total recommendations generated', ['section'])
 
 # ============================================================================
 # CORS MIDDLEWARE
@@ -232,6 +238,10 @@ async def root():
         }
     }
 
+@app.get("/metrics")
+async def get_metrics():
+    """Endpoint for Prometheus metrics."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 # ============================================================================
 # RECOMMENDATION ENDPOINTS
@@ -249,22 +259,25 @@ async def get_recommendations(request: RecommendationRequest):
     try:
         logger.info(f"📥 Recommendation request: user_id={request.user_id}")
 
-        # Get optimizer
-        optimizer = get_optimizer()
+        with REQUEST_LATENCY.labels(endpoint='/recommend').time():
+            # Get optimizer
+            optimizer = get_optimizer()
 
-        # Generate recommendations
-        recommendations = optimizer.get_recommendations(
-            user_id=request.user_id,
-            limit=request.limit,
-            exclude_ids=request.exclude_ids,
-            diversity_boost=request.diversity_boost,
-            prefer_short=request.prefer_short,
-            section=request.section,
-            language=request.language,
-            gender=request.gender,
-            category_id=request.category_id,
-            sub_category=request.sub_category
-        )
+            # Generate recommendations
+            recommendations = optimizer.get_recommendations(
+                user_id=request.user_id,
+                limit=request.limit,
+                exclude_ids=request.exclude_ids,
+                diversity_boost=request.diversity_boost,
+                prefer_short=request.prefer_short,
+                section=request.section,
+                language=request.language,
+                gender=request.gender,
+                category_id=request.category_id,
+                sub_category=request.sub_category
+            )
+            
+        RECOMMENDATION_COUNT.labels(section=request.section).inc(len(recommendations))
 
         # Build response
         response = RecommendationResponse(
@@ -576,6 +589,57 @@ async def error_codes():
             for code in ErrorCode
         }
     }
+
+
+# ============================================================================
+# DEBUG / TRANSPARENCY ENDPOINT
+# ============================================================================
+
+@app.get("/api/v1/debug-feed")
+async def debug_feed(user_id: str, category: str = "Motivation", limit: int = 30):
+    """
+    Debug endpoint to visualize exactly why feeds were chosen.
+    Returns the feed ID, final score, and the exact mathematical breakdown.
+    """
+    try:
+        optimizer = get_optimizer()
+        
+        # We simulate a recommendation request
+        recommendations = optimizer.get_recommendations(
+            user_id=user_id,
+            limit=limit,
+            category_id=category
+        )
+        
+        debug_output = []
+        for rec in recommendations:
+            metrics = rec.metadata.get("metrics", {})
+            debug_output.append({
+                "feed_id": rec.feed_id,
+                "category": rec.category,
+                "final_score": rec.score,
+                "optimizer_math": {
+                    "freshness_points": f"+{metrics.get('festival_score', 0)} (Decay formula applied)",
+                    "engagement_points": f"+{metrics.get('trending_score', 0)} (Based on watch time/scroll)",
+                    "ml_quality_points": f"+{metrics.get('push_score', 0)} (AI Confidence)",
+                    "social_proof_points": f"+{metrics.get('time_relevance_score', 0)} (Raw views)",
+                },
+                "reasons": rec.reason
+            })
+            
+        return {
+            "success": True,
+            "user_id": user_id,
+            "requested_category": category,
+            "total_returned": len(debug_output),
+            "debug_feed": debug_output
+        }
+    except Exception as e:
+        logger.error(f"Debug feed error: {e}")
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+
+
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    container_name: prithu_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=False
+      - LOG_LEVEL=INFO
+      - PRITHU_DB_URI=${PRITHU_DB_URI}
+      - PRITHU_DB_NAME=${PRITHU_DB_NAME}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: prithu_redis
+    ports:
+      - "6379:6379"
+    restart: always
