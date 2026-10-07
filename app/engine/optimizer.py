@@ -414,9 +414,14 @@ class CategoryOptimizer:
             # Sort by score descending
             scored_feeds.sort(key=lambda x: x.score, reverse=True)
 
-            # Diversity Filter
+            active_session = self.session_optimizer.get_current_session_from_db(india_time.hour)
+            
+            # Apply Strict Allocation Filter (Session: 3-6, God: 2-3, Others: 20-25)
             if diversity_boost:
-                scored_feeds = self._apply_diversity_filter(scored_feeds, max_per_category=5)
+                scored_feeds = self._apply_strict_feed_allocation(scored_feeds, active_session)
+
+            # Apply Strict GLOBAL Daily Cap (30 feeds total across all categories per day)
+            scored_feeds = self._enforce_daily_global_limit(user_id, scored_feeds, daily_limit=30)
 
             result = scored_feeds[:target_limit]
             
@@ -433,24 +438,136 @@ class CategoryOptimizer:
                 details={"error": str(e)}
             )
 
-    def _apply_diversity_filter(
+    def _apply_strict_feed_allocation(
         self,
-        recommendations: List[FeedRecommendation],
-        max_per_category: int = 5
+        scored_feeds: List[FeedRecommendation],
+        active_session: str
     ) -> List[FeedRecommendation]:
-        """Apply diversity filter across categories."""
+        """
+        Build a strictly balanced feed allocation for the 30-post daily quota:
+        - Sessions: Morning (2), Afternoon (2), Evening (2), Night (2)
+        - God (Today's Deity): 2 to 3 posts
+        - Other categories: fill the rest (~19 to 20 posts)
+        - Cap at 1 or 2 per category (God exception: up to 3).
+        """
         try:
-            filtered = []
+            god_posts = []
+            
+            # Track posts for all 4 distinct sessions
+            session_buckets = {
+                "Morning": [],
+                "Afternoon": [],
+                "Evening": [],
+                "Night": []
+            }
+            
+            other_posts = []
+            
+            current_weekday = datetime.utcnow().weekday()
+            active_god_keywords = self.god_optimizer.get_todays_god_keywords_from_db(current_weekday)
+            
             category_counts = defaultdict(int)
 
-            for rec in recommendations:
-                category = rec.category
-                if category_counts[category] < max_per_category:
-                    filtered.append(rec)
-                    category_counts[category] += 1
+            for rec in scored_feeds:
+                cat_lower = rec.category.lower().strip()
+                
+                # Check if God post
+                is_god = False
+                if cat_lower in ["god", "god quotes", "devotional", "bhakti", "spiritual"] or any(k in cat_lower for k in active_god_keywords):
+                    is_god = True
+                    
+                # Check if Session post (and which one)
+                post_session_name = None
+                for sess_name, keywords in self.session_optimizer.SESSION_KEYWORDS.items():
+                    if any(k in cat_lower for k in keywords):
+                        post_session_name = sess_name
+                        break
+                
+                if post_session_name:
+                    # Allocate strictly 2 per session
+                    if len(session_buckets[post_session_name]) < 2 and category_counts[rec.category] < 2:
+                        session_buckets[post_session_name].append(rec)
+                        category_counts[rec.category] += 1
+                elif is_god:
+                    if len(god_posts) < 3 and category_counts[rec.category] < 3:
+                        god_posts.append(rec)
+                        category_counts[rec.category] += 1
+                else:
+                    if category_counts[rec.category] < 2:
+                        other_posts.append(rec)
+                        category_counts[rec.category] += 1
+            
+            # Combine all session posts (exactly 2 from each, if available)
+            final_session = []
+            for sess_name in ["Morning", "Afternoon", "Evening", "Night"]:
+                final_session.extend(session_buckets[sess_name][:2])
+                
+            final_god = god_posts[:3]
+            
+            remaining_slots = 30 - len(final_session) - len(final_god)
+            final_other = other_posts[:remaining_slots]
+            
+            final_feed = []
+            final_feed.extend(final_session)
+            final_feed.extend(final_god)
+            final_feed.extend(final_other)
+            
+            # Re-sort the combined allocation by score to interleave them nicely
+            final_feed.sort(key=lambda x: x.score, reverse=True)
+            
+            return final_feed
+        except Exception as e:
+            logger.error(f"Failed strict allocation: {e}")
+            return scored_feeds
 
+    def _enforce_daily_global_limit(
+        self,
+        user_id: str,
+        recommendations: List[FeedRecommendation],
+        daily_limit: int = 30
+    ) -> List[FeedRecommendation]:
+        """
+        Enforce a strict daily cap (e.g. 30 feeds TOTAL) across all categories per user.
+        Tracks unique served feed IDs in a Redis Set.
+        """
+        try:
+            if not getattr(self.redis, 'enabled', False) or not getattr(self.redis, 'client', None):
+                return recommendations
+
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            redis_key = f"daily_global_cap:{user_id}:{today_str}"
+            
+            # Get the number of unique feeds already served today
+            current_served = self.redis.client.scard(redis_key)
+            if current_served >= daily_limit:
+                # Limit reached for today, return empty list (no more refreshing)
+                return []
+            
+            filtered = []
+            new_feed_ids = []
+
+            for rec in recommendations:
+                # Check if this specific feed was already allocated to them today
+                is_member = self.redis.client.sismember(redis_key, rec.feed_id)
+                
+                if is_member:
+                    # They are refreshing, and this feed was already part of their daily quota, so allow it
+                    filtered.append(rec)
+                else:
+                    # This is a brand new feed attempting to be served today
+                    if (current_served + len(new_feed_ids)) < daily_limit:
+                        filtered.append(rec)
+                        new_feed_ids.append(rec.feed_id)
+                    
+            # Update Redis with the newly served feed IDs
+            if new_feed_ids:
+                self.redis.client.sadd(redis_key, *new_feed_ids)
+                # Ensure the key expires after 24 hours (86400 seconds)
+                self.redis.client.expire(redis_key, 86400)
+                
             return filtered
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to enforce daily global limit: {e}")
             return recommendations
 
     def health_check(self) -> bool:
