@@ -109,29 +109,18 @@ class UserRecencyStaggerEngine:
         """
         try:
             profile = self.get_user_profile(user_id)
-            created_at = profile.get("createdAt") or profile.get("created_at")
-
-            is_new_user = False
-            account_age_days = Config.NEW_USER_AGE_DAYS + 1
-
-            if isinstance(created_at, datetime):
-                account_age_days = (datetime.utcnow() - created_at).days
-                is_new_user = account_age_days <= Config.NEW_USER_AGE_DAYS
-            elif seen_count < 10:
-                # Level 2 Fallback: < 10 seen feeds -> New User
-                is_new_user = True
-                account_age_days = 1
-
             days_away = self.get_days_since_last_login(user_id, profile)
-
-            label = "New User (Backlog Strategy)" if is_new_user else f"Old User (Catchup {days_away}d Strategy)"
-            logger.info(f"👥 User {user_id}: Age={account_age_days}d, DaysAway={days_away}d ➔ Strategy: [{label}]")
+            
+            # Disable Backlog Strategy completely based on user feedback
+            is_new_user = False
+            label = f"Standard Strategy (Catchup {days_away}d)"
+            logger.info(f"👥 User {user_id}: DaysAway={days_away}d ➔ Strategy: [{label}]")
 
             return is_new_user, days_away, label
 
         except Exception as e:
             logger.warning(f"Error classifying user {user_id}: {e}")
-            return False, Config.OLD_USER_FRESHNESS_DAYS, "Old User (Default Catchup Strategy)"
+            return False, Config.OLD_USER_FRESHNESS_DAYS, "Standard Strategy"
 
     def get_candidate_feeds(
         self,

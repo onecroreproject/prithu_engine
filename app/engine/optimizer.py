@@ -447,8 +447,8 @@ class CategoryOptimizer:
         Build a strictly balanced feed allocation for the 30-post daily quota:
         - Sessions: Morning (2), Afternoon (2), Evening (2), Night (2)
         - God (Today's Deity): 2 to 3 posts
-        - Other categories: fill the rest (~19 to 20 posts)
-        - Cap at 1 or 2 per category (God exception: up to 3).
+        - Category Fatigue Filter: Limit normal categories to max 4 per batch.
+          (If we run out of diverse posts before hitting 30, we relax the cap to fill the quota).
         """
         try:
             god_posts = []
@@ -462,11 +462,13 @@ class CategoryOptimizer:
             }
             
             other_posts = []
+            overflow_posts = [] # Posts that exceed the category cap, used as fallback
             
             current_weekday = datetime.utcnow().weekday()
             active_god_keywords = self.god_optimizer.get_todays_god_keywords_from_db(current_weekday)
             
             category_counts = defaultdict(int)
+            FATIGUE_CAP = 4
 
             for rec in scored_feeds:
                 cat_lower = rec.category.lower().strip()
@@ -485,32 +487,39 @@ class CategoryOptimizer:
                 
                 if post_session_name:
                     # Allocate strictly 2 per session
-                    if len(session_buckets[post_session_name]) < 2 and category_counts[rec.category] < 2:
+                    if len(session_buckets[post_session_name]) < 2:
                         session_buckets[post_session_name].append(rec)
                         category_counts[rec.category] += 1
+                    else:
+                        overflow_posts.append(rec)
                 elif is_god:
-                    if len(god_posts) < 3 and category_counts[rec.category] < 3:
+                    if len(god_posts) < 3:
                         god_posts.append(rec)
                         category_counts[rec.category] += 1
+                    else:
+                        overflow_posts.append(rec)
                 else:
-                    if category_counts[rec.category] < 2:
+                    if category_counts[rec.category] < FATIGUE_CAP:
                         other_posts.append(rec)
                         category_counts[rec.category] += 1
+                    else:
+                        # Save in case we don't have enough diverse content to reach 30
+                        overflow_posts.append(rec)
             
             # Combine all session posts (exactly 2 from each, if available)
-            final_session = []
-            for sess_name in ["Morning", "Afternoon", "Evening", "Night"]:
-                final_session.extend(session_buckets[sess_name][:2])
-                
-            final_god = god_posts[:3]
-            
-            remaining_slots = 30 - len(final_session) - len(final_god)
-            final_other = other_posts[:remaining_slots]
-            
             final_feed = []
-            final_feed.extend(final_session)
-            final_feed.extend(final_god)
-            final_feed.extend(final_other)
+            for sess_name in ["Morning", "Afternoon", "Evening", "Night"]:
+                final_feed.extend(session_buckets[sess_name][:2])
+                
+            final_feed.extend(god_posts[:3])
+            
+            remaining_slots = 30 - len(final_feed)
+            final_feed.extend(other_posts[:remaining_slots])
+
+            # If we were too strict and didn't reach 30 feeds, fill with overflow posts
+            if len(final_feed) < 30 and overflow_posts:
+                needed = 30 - len(final_feed)
+                final_feed.extend(overflow_posts[:needed])
             
             # Re-sort the combined allocation by score to interleave them nicely
             final_feed.sort(key=lambda x: x.score, reverse=True)
@@ -528,17 +537,50 @@ class CategoryOptimizer:
     ) -> List[FeedRecommendation]:
         """
         Enforce a strict daily cap (e.g. 30 feeds TOTAL) across all categories per user.
-        Tracks unique served feed IDs in a Redis Set.
+        Uses Redis if available, falls back to MongoDB UserFeedAnalytics otherwise.
         """
         try:
-            if not getattr(self.redis, 'enabled', False) or not getattr(self.redis, 'client', None):
-                return recommendations
+            current_served = 0
+            served_today = set()
 
+            # Attempt Redis first
+            redis_used = False
             today_str = datetime.utcnow().strftime("%Y-%m-%d")
             redis_key = f"daily_global_cap:{user_id}:{today_str}"
-            
-            # Get the number of unique feeds already served today
-            current_served = self.redis.client.scard(redis_key)
+
+            if getattr(self.redis, 'enabled', False) and getattr(self.redis, 'client', None):
+                try:
+                    current_served = self.redis.client.scard(redis_key)
+                    # We can't easily fetch all members if large, but we can check individually below
+                    redis_used = True
+                except Exception:
+                    redis_used = False
+
+            # MongoDB Fallback if Redis is unavailable
+            if not redis_used:
+                from bson import ObjectId
+                today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                try:
+                    user_oid = ObjectId(user_id)
+                except:
+                    user_oid = user_id
+                
+                query = {
+                    "$or": [{"userId": user_id}, {"userId": user_oid}, {"user_id": user_id}, {"user_id": user_oid}],
+                    "_id": {"$gte": ObjectId.from_datetime(today_start)}
+                }
+                # Check UserFeedAnalytics and UserImageView for today's count
+                analytics_docs = self.db.find_many("UserFeedAnalytics", query, {"feedId": 1, "feed_id": 1, "postId": 1})
+                image_docs = self.db.find_many("UserImageView", query, {"imageId": 1})
+                video_docs = self.db.find_many("UserVideoView", query, {"videoId": 1})
+                
+                for doc in analytics_docs + image_docs + video_docs:
+                    fid = doc.get("feedId") or doc.get("feed_id") or doc.get("postId") or doc.get("imageId") or doc.get("videoId")
+                    if fid:
+                        served_today.add(str(fid))
+                
+                current_served = len(served_today)
+
             if current_served >= daily_limit:
                 # Limit reached for today, return empty list (no more refreshing)
                 return []
@@ -548,7 +590,11 @@ class CategoryOptimizer:
 
             for rec in recommendations:
                 # Check if this specific feed was already allocated to them today
-                is_member = self.redis.client.sismember(redis_key, rec.feed_id)
+                is_member = False
+                if redis_used:
+                    is_member = self.redis.client.sismember(redis_key, rec.feed_id)
+                else:
+                    is_member = str(rec.feed_id) in served_today
                 
                 if is_member:
                     # They are refreshing, and this feed was already part of their daily quota, so allow it
@@ -559,8 +605,8 @@ class CategoryOptimizer:
                         filtered.append(rec)
                         new_feed_ids.append(rec.feed_id)
                     
-            # Update Redis with the newly served feed IDs
-            if new_feed_ids:
+            # Update Redis with the newly served feed IDs if using Redis
+            if redis_used and new_feed_ids:
                 self.redis.client.sadd(redis_key, *new_feed_ids)
                 # Ensure the key expires after 24 hours (86400 seconds)
                 self.redis.client.expire(redis_key, 86400)
